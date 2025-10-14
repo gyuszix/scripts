@@ -1,0 +1,14 @@
+# Python virtual environments
+venv/
+*/venv/
+
+# Google credentials and tokens
+client_secret_*.json
+token.json
+
+# macOS system files
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
