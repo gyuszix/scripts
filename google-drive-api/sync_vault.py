@@ -1,110 +1,103 @@
-import os
-import time
-import hashlib
-from googleapiclient.http import MediaFileUpload
+from __future__ import print_function
+import os, io, hashlib
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from drive_auth import get_service
 
 # === CONFIGURATION ===
-LOCAL_PATH = "/Users/gyuszix/Documents/ObsidianVault"  # your local vault folder
-DRIVE_FOLDER_NAME = "ObsidianVaultGoogleDrive"          # target Drive folder name
-
-# Exclusions — filenames or extensions to skip
-EXCLUDE_FILES = {
-    ".DS_Store",
-    "workspace.json",
-    "appearance.json",
-    "app.json",
-}
-EXCLUDE_EXTENSIONS = {".log"}  # example: skip .log files
+LOCAL_PATH = "/Users/gyuszix/Documents/ObsidianVault/Vault-Mk1"
+DRIVE_FOLDER_NAME = "ObsidianVaultGoogleDrive"
+EXCLUDE_FILES = {".DS_Store", "workspace.json", "appearance.json", "app.json"}
+EXCLUDE_EXTENSIONS = {".log"}
 # ======================
 
-
-def should_skip(file_name):
-    """Decide whether a file should be skipped."""
-    if file_name in EXCLUDE_FILES:
-        return True
-    if any(file_name.endswith(ext) for ext in EXCLUDE_EXTENSIONS):
-        return True
-    if file_name.startswith("."):  # skip hidden files like .gitignore
-        return True
-    return False
-
+def should_skip(name):
+    return (
+        name in EXCLUDE_FILES
+        or any(name.endswith(ext) for ext in EXCLUDE_EXTENSIONS)
+        or name.startswith(".")
+    )
 
 def file_md5(path):
-    """Compute MD5 hash of a local file."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
 
-
 def ensure_folder(service, name):
-    """Find or create the folder on Google Drive."""
     resp = service.files().list(
         q=f"name='{name}' and mimeType='application/vnd.google-apps.folder'",
-        fields="files(id, name)"
+        fields="files(id)"
     ).execute()
     if resp["files"]:
         return resp["files"][0]["id"]
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    return service.files().create(body=body, fields="id").execute()["id"]
 
-    folder_metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-    created = service.files().create(body=folder_metadata, fields="id").execute()
-    return created["id"]
-
-
-def upload_or_update(service, parent_id, file_path):
-    """Upload or update a single file using MD5 content check."""
-    file_name = os.path.basename(file_path)
-
-    # Skip unwanted files
-    if should_skip(file_name):
-        print(f"Skipped: {file_name}")
-        return
-
-    query = f"'{parent_id}' in parents and name='{file_name}'"
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, md5Checksum)"
-    ).execute()
-    files = results.get("files", [])
-    media = MediaFileUpload(file_path, resumable=True)
-
-    local_hash = file_md5(file_path)
-
-    if not files:
-        service.files().create(
-            body={"name": file_name, "parents": [parent_id]},
-            media_body=media,
-            fields="id"
+def list_drive_files(service, folder_id):
+    files, token = {}, None
+    while True:
+        r = service.files().list(
+            q=f"'{folder_id}' in parents and mimeType!='application/vnd.google-apps.folder'",
+            fields="nextPageToken, files(id,name,md5Checksum,modifiedTime)",
+            pageToken=token,
         ).execute()
-        print(f"Uploaded: {file_name}")
+        for f in r["files"]:
+            files[f["name"]] = f
+        token = r.get("nextPageToken")
+        if not token:
+            break
+    return files
+
+def upload_or_update(service, folder_id, path, drive_file=None):
+    name = os.path.basename(path)
+    if should_skip(name):
+        return
+    media = MediaFileUpload(path, resumable=True)
+    local_hash = file_md5(path)
+    if not drive_file:
+        service.files().create(body={"name": name, "parents": [folder_id]}, media_body=media).execute()
+        print(f"☁️  Uploaded: {name}")
+    elif drive_file.get("md5Checksum") != local_hash:
+        service.files().update(fileId=drive_file["id"], media_body=media).execute()
+        print(f"🔄 Updated on Drive: {name}")
     else:
-        drive_file = files[0]
-        drive_hash = drive_file.get("md5Checksum")
-        if drive_hash != local_hash:
-            service.files().update(fileId=drive_file["id"], media_body=media).execute()
-            print(f"Updated: {file_name}")
-        else:
-            print(f"Unchanged: {file_name}")
+        print(f"✅ Unchanged: {name}")
 
+def download_file(service, drive_file, local_dir):
+    name = drive_file["name"]
+    os.makedirs(local_dir, exist_ok=True)
+    req = service.files().get_media(fileId=drive_file["id"])
+    with open(os.path.join(local_dir, name), "wb") as f:
+        downloader = MediaIoBaseDownload(f, req)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    print(f"⬇️  Downloaded: {name}")
 
-def sync_vault():
-    """Sync all files from your local folder to Drive."""
+def sync_two_way():
     service = get_service()
     folder_id = ensure_folder(service, DRIVE_FOLDER_NAME)
+    print(f"\n🔄 Two-way sync between '{LOCAL_PATH}' and Drive '{DRIVE_FOLDER_NAME}'\n")
 
-    print(f"Syncing '{LOCAL_PATH}' → Google Drive folder '{DRIVE_FOLDER_NAME}' ...\n")
-    for root, dirs, files in os.walk(LOCAL_PATH):
-        # Skip hidden folders
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+    drive_files = list_drive_files(service, folder_id)
+    local_files = {
+        f: {"path": os.path.join(LOCAL_PATH, f), "hash": file_md5(os.path.join(LOCAL_PATH, f))}
+        for f in os.listdir(LOCAL_PATH)
+        if os.path.isfile(os.path.join(LOCAL_PATH, f)) and not should_skip(f)
+    }
 
-        for f in files:
-            file_path = os.path.join(root, f)
-            upload_or_update(service, folder_id, file_path)
+    # Upload new / changed locals
+    for name, info in local_files.items():
+        upload_or_update(service, folder_id, info["path"], drive_files.get(name))
+
+    # Download new / changed drives
+    for name, dfile in drive_files.items():
+        lpath = os.path.join(LOCAL_PATH, name)
+        if name not in local_files or dfile.get("md5Checksum") != local_files[name]["hash"]:
+            download_file(service, dfile, LOCAL_PATH)
 
     print("\n✅ Sync complete.")
 
-
 if __name__ == "__main__":
-    sync_vault()
+    sync_two_way()
