@@ -1,0 +1,16 @@
+# Ignore files
+.DS_Store
+workspace.json
+appearance.json
+app.json
+*.log
+*.tmp
+*.bak
+*.swp
+Untitled.*
+
+# Ignore directories
+.git/
+.obsidian/
+__pycache__/
+.idea/
